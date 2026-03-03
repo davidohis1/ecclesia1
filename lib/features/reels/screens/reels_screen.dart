@@ -12,6 +12,7 @@ import '../../../core/constants/app_constants.dart';
 import '../../../models/other_models.dart';
 import '../../../services/bunny_storage_service.dart';
 import '../../../services/auth_service.dart';
+import '../../../core/utils/navigation.dart';
 
 class ReelsScreen extends StatefulWidget {
   const ReelsScreen({super.key});
@@ -254,42 +255,46 @@ class _ReelPlayerState extends State<_ReelPlayer> {
           ),
 
           // Bottom info
-          Positioned(
-            left: 16,
-            right: 80,
-            bottom: 40,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    UserAvatar(
-                        name: widget.reel.authorName,
-                        imageUrl: widget.reel.authorProfilePic,
-                        size: 36),
-                    const SizedBox(width: 8),
-                    Text(
-                      '@${widget.reel.authorUsername}',
-                      style: GoogleFonts.dmSans(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 14,
-                      ),
-                    ),
-                  ],
-                ),
-                if (widget.reel.caption != null) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    widget.reel.caption!,
-                    style: GoogleFonts.dmSans(color: Colors.white70, fontSize: 13),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
-              ],
+          // Bottom info
+Positioned(
+  left: 16,
+  right: 80,
+  bottom: 40,
+  child: Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      GestureDetector(  // ← Wrap with GestureDetector
+        onTap: () => openProfile(context, widget.reel.authorId),  // ← Add this
+        child: Row(
+          children: [
+            UserAvatar(
+                name: widget.reel.authorName,
+                imageUrl: widget.reel.authorProfilePic,
+                size: 36),
+            const SizedBox(width: 8),
+            Text(
+              '@${widget.reel.authorUsername}',
+              style: GoogleFonts.dmSans(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                fontSize: 14,
+              ),
             ),
-          ),
+          ],
+        ),
+      ),
+      if (widget.reel.caption != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          widget.reel.caption!,
+          style: GoogleFonts.dmSans(color: Colors.white70, fontSize: 13),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ],
+    ],
+  ),
+),
 
           // Pause indicator
           if (_controller?.value.isInitialized == true &&

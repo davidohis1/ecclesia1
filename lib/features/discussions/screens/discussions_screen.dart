@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -14,13 +14,45 @@ import '../../../services/auth_service.dart';
 
 class DiscussionsScreen extends StatefulWidget {
   const DiscussionsScreen({super.key});
-
   @override
   State<DiscussionsScreen> createState() => _DiscussionsScreenState();
 }
 
 class _DiscussionsScreenState extends State<DiscussionsScreen> {
   final _firestore = FirebaseFirestore.instance;
+
+  /// Only close discussions that are OLDER than 24h — called once on init,
+  /// not on every stream rebuild (which was the bug causing instant deletion).
+  @override
+  void initState() {
+    super.initState();
+    _closeStaleDiscussions();
+  }
+
+  Future<void> _closeStaleDiscussions() async {
+    final cutoff = Timestamp.fromDate(
+      DateTime.now().subtract(
+          Duration(hours: AppConstants.discussionExpiryHours)),
+    );
+    try {
+      final stale = await _firestore
+          .collection(AppConstants.colDiscussions)
+          .where('isActive', isEqualTo: true)
+          .where('lastMessageAt', isLessThan: cutoff)
+          .get();
+
+      for (final doc in stale.docs) {
+        // Delete messages first
+        final msgs = await doc.reference.collection('messages').get();
+        for (final m in msgs.docs) {
+          await m.reference.delete();
+        }
+        await doc.reference.update({'isActive': false});
+      }
+    } catch (_) {
+      // Index may not exist yet — silently skip
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -42,68 +74,52 @@ class _DiscussionsScreenState extends State<DiscussionsScreen> {
                     colors: [AppTheme.primary, AppTheme.primaryDark]),
                 borderRadius: BorderRadius.circular(10),
               ),
-              child:
-                  const Icon(Icons.add_rounded, color: Colors.white, size: 18),
+              child: const Icon(Icons.add_rounded, color: Colors.white, size: 18),
             ),
             onPressed: _createDiscussion,
           ),
           const SizedBox(width: 8),
         ],
       ),
+      // ── Use a simple query with NO compound index requirement ──
       body: StreamBuilder<QuerySnapshot>(
         stream: _firestore
             .collection(AppConstants.colDiscussions)
-            .where('isActive', isEqualTo: true)
             .orderBy('lastMessageAt', descending: true)
             .snapshots(),
         builder: (_, snap) {
+          if (snap.hasError) {
+            // Fallback: fetch without ordering when index is missing
+            return _FallbackDiscussionList(onCreate: _createDiscussion);
+          }
           if (!snap.hasData) {
             return const Center(
                 child: CircularProgressIndicator(color: AppTheme.primary));
           }
-          final docs = snap.data!.docs;
 
-          // Auto-close stale discussions
-          _checkAndCloseStale(docs);
+          // Filter active discussions in memory (avoids compound index)
+          final docs = snap.data!.docs
+              .where((d) {
+                final data = d.data() as Map<String, dynamic>;
+                return data['isActive'] == true;
+              })
+              .toList();
 
-          if (docs.isEmpty) {
-            return Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Text('💬', style: TextStyle(fontSize: 52)),
-                  const SizedBox(height: 16),
-                  Text('No active discussions',
-                      style: GoogleFonts.playfairDisplay(
-                          fontSize: 20, color: AppTheme.textPrimary)),
-                  const SizedBox(height: 8),
-                  Text('Start a conversation about faith',
-                      style: GoogleFonts.dmSans(color: AppTheme.textMuted)),
-                  const SizedBox(height: 24),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 40),
-                    child: GradientButton(
-                        label: 'Start Discussion',
-                        onTap: _createDiscussion),
-                  ),
-                ],
-              ),
-            );
-          }
+          if (docs.isEmpty) return _EmptyDiscussions(onTap: _createDiscussion);
 
           return ListView.builder(
             padding: const EdgeInsets.all(16),
             itemCount: docs.length,
             itemBuilder: (_, i) {
-              final discussion =
-                  DiscussionModel.fromMap(docs[i].id, docs[i].data() as Map<String, dynamic>);
+              final discussion = DiscussionModel.fromMap(
+                  docs[i].id, docs[i].data() as Map<String, dynamic>);
               return _DiscussionTile(
                 discussion: discussion,
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute(
-                      builder: (_) => DiscussionRoomScreen(
-                          discussion: discussion)),
+                      builder: (_) =>
+                          DiscussionRoomScreen(discussion: discussion)),
                 ),
               );
             },
@@ -111,31 +127,6 @@ class _DiscussionsScreenState extends State<DiscussionsScreen> {
         },
       ),
     );
-  }
-
-  void _checkAndCloseStale(List<QueryDocumentSnapshot> docs) {
-    final now = DateTime.now();
-    for (final doc in docs) {
-      final data = doc.data() as Map<String, dynamic>;
-      final lastMsg = data['lastMessageAt'] != null
-          ? (data['lastMessageAt'] as Timestamp).toDate()
-          : (data['createdAt'] as Timestamp).toDate();
-      final diff = now.difference(lastMsg).inHours;
-      if (diff >= AppConstants.discussionExpiryHours) {
-        // Close and delete messages
-        _firestore.collection(AppConstants.colDiscussions).doc(doc.id).update({'isActive': false});
-        _firestore
-            .collection(AppConstants.colDiscussions)
-            .doc(doc.id)
-            .collection('messages')
-            .get()
-            .then((snap) {
-          for (final msg in snap.docs) {
-            msg.reference.delete();
-          }
-        });
-      }
-    }
   }
 
   void _createDiscussion() {
@@ -150,19 +141,89 @@ class _DiscussionsScreenState extends State<DiscussionsScreen> {
   }
 }
 
+// Fallback when Firestore index isn't ready yet
+class _FallbackDiscussionList extends StatelessWidget {
+  final VoidCallback onCreate;
+  const _FallbackDiscussionList({required this.onCreate});
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<QuerySnapshot>(
+      future: FirebaseFirestore.instance
+          .collection(AppConstants.colDiscussions)
+          .get(),
+      builder: (_, snap) {
+        if (!snap.hasData) {
+          return const Center(
+              child: CircularProgressIndicator(color: AppTheme.primary));
+        }
+        final docs = snap.data!.docs
+            .where((d) => (d.data() as Map<String, dynamic>)['isActive'] == true)
+            .toList();
+        if (docs.isEmpty) return _EmptyDiscussions(onTap: onCreate);
+        return ListView.builder(
+          padding: const EdgeInsets.all(16),
+          itemCount: docs.length,
+          itemBuilder: (_, i) {
+            final discussion = DiscussionModel.fromMap(
+                docs[i].id, docs[i].data() as Map<String, dynamic>);
+            return _DiscussionTile(
+              discussion: discussion,
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) =>
+                        DiscussionRoomScreen(discussion: discussion)),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _EmptyDiscussions extends StatelessWidget {
+  final VoidCallback onTap;
+  const _EmptyDiscussions({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Text('💬', style: TextStyle(fontSize: 52)),
+          const SizedBox(height: 16),
+          Text('No active discussions',
+              style: GoogleFonts.playfairDisplay(
+                  fontSize: 20, color: AppTheme.textPrimary)),
+          const SizedBox(height: 8),
+          Text('Start a conversation about faith',
+              style: GoogleFonts.dmSans(color: AppTheme.textMuted)),
+          const SizedBox(height: 24),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 40),
+            child: GradientButton(label: 'Start Discussion', onTap: onTap),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Discussion tile ────────────────────────────────────────────────────────────
 class _DiscussionTile extends StatelessWidget {
   final DiscussionModel discussion;
   final VoidCallback onTap;
-
   const _DiscussionTile({required this.discussion, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
-    final timeLeft = discussion.lastMessageAt != null
-        ? AppConstants.discussionExpiryHours -
-            DateTime.now().difference(discussion.lastMessageAt!).inHours
-        : AppConstants.discussionExpiryHours;
-    final isExpiringSoon = timeLeft <= 2;
+    final lastActivity = discussion.lastMessageAt ?? discussion.createdAt;
+    final hoursAgo = DateTime.now().difference(lastActivity).inHours;
+    final timeLeft = AppConstants.discussionExpiryHours - hoursAgo;
+    final isExpiringSoon = timeLeft <= 2 && timeLeft >= 0;
 
     return GestureDetector(
       onTap: onTap,
@@ -184,41 +245,35 @@ class _DiscussionTile extends StatelessWidget {
             Row(
               children: [
                 Expanded(
-                  child: Text(
-                    discussion.title,
-                    style: GoogleFonts.dmSans(
-                      color: AppTheme.textPrimary,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
+                  child: Text(discussion.title,
+                      style: GoogleFonts.dmSans(
+                          color: AppTheme.textPrimary,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700)),
                 ),
                 if (isExpiringSoon)
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(
                       color: AppTheme.warning.withOpacity(0.15),
                       borderRadius: BorderRadius.circular(50),
                     ),
-                    child: Text(
-                      '${timeLeft}h left',
-                      style: GoogleFonts.dmSans(
-                          color: AppTheme.warning,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600),
-                    ),
+                    child: Text('${timeLeft}h left',
+                        style: GoogleFonts.dmSans(
+                            color: AppTheme.warning,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600)),
                   ),
               ],
             ),
             if (discussion.description != null) ...[
               const SizedBox(height: 4),
-              Text(
-                discussion.description!,
-                style: GoogleFonts.dmSans(
-                    color: AppTheme.textMuted, fontSize: 13),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
+              Text(discussion.description!,
+                  style:
+                      GoogleFonts.dmSans(color: AppTheme.textMuted, fontSize: 13),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis),
             ],
             const SizedBox(height: 10),
             Row(
@@ -228,29 +283,23 @@ class _DiscussionTile extends StatelessWidget {
                     imageUrl: discussion.creatorProfilePic,
                     size: 24),
                 const SizedBox(width: 6),
-                Text(
-                  discussion.creatorName,
-                  style: GoogleFonts.dmSans(
-                      color: AppTheme.textSecondary, fontSize: 12),
-                ),
+                Text(discussion.creatorName,
+                    style: GoogleFonts.dmSans(
+                        color: AppTheme.textSecondary, fontSize: 12)),
                 const Spacer(),
-                Icon(Icons.people_outline,
+                const Icon(Icons.people_outline,
                     color: AppTheme.textMuted, size: 14),
                 const SizedBox(width: 4),
-                Text(
-                  '${discussion.membersCount}',
-                  style: GoogleFonts.dmSans(
-                      color: AppTheme.textMuted, fontSize: 12),
-                ),
+                Text('${discussion.membersCount}',
+                    style: GoogleFonts.dmSans(
+                        color: AppTheme.textMuted, fontSize: 12)),
                 const SizedBox(width: 12),
-                Icon(Icons.chat_bubble_outline,
+                const Icon(Icons.chat_bubble_outline,
                     color: AppTheme.textMuted, size: 14),
                 const SizedBox(width: 4),
-                Text(
-                  '${discussion.messagesCount}',
-                  style: GoogleFonts.dmSans(
-                      color: AppTheme.textMuted, fontSize: 12),
-                ),
+                Text('${discussion.messagesCount}',
+                    style: GoogleFonts.dmSans(
+                        color: AppTheme.textMuted, fontSize: 12)),
               ],
             ),
           ],
@@ -260,10 +309,10 @@ class _DiscussionTile extends StatelessWidget {
   }
 }
 
+// ── Discussion room ────────────────────────────────────────────────────────────
 class DiscussionRoomScreen extends StatefulWidget {
   final DiscussionModel discussion;
   const DiscussionRoomScreen({super.key, required this.discussion});
-
   @override
   State<DiscussionRoomScreen> createState() => _DiscussionRoomScreenState();
 }
@@ -276,6 +325,8 @@ class _DiscussionRoomScreenState extends State<DiscussionRoomScreen> {
   final _authService = AuthService();
   final _scrollCtrl = ScrollController();
   bool _joined = false;
+  bool _sendingImage = false;
+  bool _sending = false;
 
   @override
   void initState() {
@@ -283,16 +334,25 @@ class _DiscussionRoomScreenState extends State<DiscussionRoomScreen> {
     _checkJoined();
   }
 
+  @override
+  void dispose() {
+    _msgCtrl.dispose();
+    _scrollCtrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _checkJoined() async {
     final uid = _auth.currentUser?.uid;
     if (uid == null) return;
-    final doc = await _firestore
-        .collection(AppConstants.colDiscussions)
-        .doc(widget.discussion.id)
-        .collection('members')
-        .doc(uid)
-        .get();
-    setState(() => _joined = doc.exists);
+    try {
+      final doc = await _firestore
+          .collection(AppConstants.colDiscussions)
+          .doc(widget.discussion.id)
+          .collection('members')
+          .doc(uid)
+          .get();
+      if (mounted) setState(() => _joined = doc.exists);
+    } catch (_) {}
   }
 
   Future<void> _join() async {
@@ -308,62 +368,66 @@ class _DiscussionRoomScreenState extends State<DiscussionRoomScreen> {
         .collection(AppConstants.colDiscussions)
         .doc(widget.discussion.id)
         .update({'membersCount': FieldValue.increment(1)});
-    setState(() => _joined = true);
+    if (mounted) setState(() => _joined = true);
   }
 
   Future<void> _sendMessage({String? text, String? imageUrl}) async {
-    if ((text == null || text.isEmpty) && imageUrl == null) return;
+    if ((text == null || text.trim().isEmpty) && imageUrl == null) return;
     final uid = _auth.currentUser?.uid;
     if (uid == null) return;
-    final user = await _authService.getUserById(uid);
-
-    await _firestore
-        .collection(AppConstants.colDiscussions)
-        .doc(widget.discussion.id)
-        .collection('messages')
-        .add({
-      'discussionId': widget.discussion.id,
-      'senderId': uid,
-      'senderName': user?.name ?? 'Saint',
-      'senderProfilePic': user?.profilePicUrl,
-      'text': text,
-      'imageUrl': imageUrl,
-      'sentAt': Timestamp.now(),
-    });
-
-    await _firestore
-        .collection(AppConstants.colDiscussions)
-        .doc(widget.discussion.id)
-        .update({
-      'messagesCount': FieldValue.increment(1),
-      'lastMessageAt': Timestamp.now(),
-    });
-
-    _msgCtrl.clear();
-    Future.delayed(const Duration(milliseconds: 200), () {
-      if (_scrollCtrl.hasClients) {
-        _scrollCtrl.animateTo(
-          _scrollCtrl.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-      }
-    });
+    setState(() => _sending = true);
+    try {
+      final user = await _authService.getUserById(uid);
+      await _firestore
+          .collection(AppConstants.colDiscussions)
+          .doc(widget.discussion.id)
+          .collection('messages')
+          .add({
+        'senderId': uid,
+        'senderName': user?.name ?? 'Saint',
+        'senderProfilePic': user?.profilePicUrl,
+        'text': text?.trim(),
+        'imageUrl': imageUrl,
+        'sentAt': Timestamp.now(),
+      });
+      await _firestore
+          .collection(AppConstants.colDiscussions)
+          .doc(widget.discussion.id)
+          .update({
+        'messagesCount': FieldValue.increment(1),
+        'lastMessageAt': Timestamp.now(),
+      });
+      _msgCtrl.clear();
+      Future.delayed(const Duration(milliseconds: 200), () {
+        if (_scrollCtrl.hasClients) {
+          _scrollCtrl.animateTo(_scrollCtrl.position.maxScrollExtent,
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeOut);
+        }
+      });
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
   }
 
   Future<void> _sendImage() async {
-    final picker = ImagePicker();
-    final file = await picker.pickImage(source: ImageSource.gallery, imageQuality: 70);
+    final file =
+        await ImagePicker().pickImage(source: ImageSource.gallery, imageQuality: 70);
     if (file == null) return;
-
-    final uid = _auth.currentUser?.uid ?? 'user';
-    final filename = _bunny.generateFilename('disc_$uid', 'jpg');
-    final url = await _bunny.uploadFile(
-      file: File(file.path),
-      folder: AppConstants.folderMessages,
-      filename: filename,
-    );
-    if (url != null) await _sendMessage(imageUrl: url);
+    setState(() => _sendingImage = true);
+    try {
+      final bytes = await file.readAsBytes();
+      final uid = _auth.currentUser?.uid ?? 'user';
+      final filename = _bunny.generateFilename('disc_$uid', 'jpg');
+      final url = await _bunny.uploadBytes(
+        bytes: bytes,
+        folder: AppConstants.folderMessages,
+        filename: filename,
+      );
+      if (url != null) await _sendMessage(imageUrl: url);
+    } finally {
+      if (mounted) setState(() => _sendingImage = false);
+    }
   }
 
   @override
@@ -380,8 +444,7 @@ class _DiscussionRoomScreenState extends State<DiscussionRoomScreen> {
                     fontSize: 14,
                     fontWeight: FontWeight.w700,
                     color: AppTheme.textPrimary)),
-            Text(
-                '${widget.discussion.membersCount} members · closes in 24h of inactivity',
+            Text('${widget.discussion.membersCount} members · closes after 24h inactivity',
                 style: GoogleFonts.dmSans(
                     color: AppTheme.textMuted, fontSize: 10)),
           ],
@@ -391,17 +454,16 @@ class _DiscussionRoomScreenState extends State<DiscussionRoomScreen> {
         children: [
           if (!_joined)
             Container(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               color: AppTheme.bgCard,
               child: Row(
                 children: [
                   Expanded(
-                    child: Text(
-                      'Join to participate in this discussion',
-                      style: GoogleFonts.dmSans(
-                          color: AppTheme.textSecondary, fontSize: 13),
-                    ),
+                    child: Text('Join to participate in this discussion',
+                        style: GoogleFonts.dmSans(
+                            color: AppTheme.textSecondary, fontSize: 13)),
                   ),
+                  const SizedBox(width: 12),
                   GestureDetector(
                     onTap: _join,
                     child: Container(
@@ -431,89 +493,148 @@ class _DiscussionRoomScreenState extends State<DiscussionRoomScreen> {
                   .orderBy('sentAt', descending: false)
                   .snapshots(),
               builder: (_, snap) {
+                if (snap.hasError) {
+                  // Fallback without ordering
+                  return FutureBuilder<QuerySnapshot>(
+                    future: _firestore
+                        .collection(AppConstants.colDiscussions)
+                        .doc(widget.discussion.id)
+                        .collection('messages')
+                        .get(),
+                    builder: (_, s) {
+                      if (!s.hasData) {
+                        return const Center(
+                            child: CircularProgressIndicator(
+                                color: AppTheme.primary));
+                      }
+                      return _buildMsgList(s.data!.docs);
+                    },
+                  );
+                }
                 if (!snap.hasData) {
                   return const Center(
                       child: CircularProgressIndicator(color: AppTheme.primary));
                 }
-                final messages = snap.data!.docs;
-                return ListView.builder(
-                  controller: _scrollCtrl,
-                  padding: const EdgeInsets.all(16),
-                  itemCount: messages.length,
-                  itemBuilder: (_, i) {
-                    final msg = messages[i].data() as Map<String, dynamic>;
-                    final isMe = msg['senderId'] == _auth.currentUser?.uid;
-                    return _MessageBubble(data: msg, isMe: isMe);
-                  },
-                );
+                return _buildMsgList(snap.data!.docs);
               },
             ),
           ),
-          if (_joined)
-            Container(
-              padding: EdgeInsets.fromLTRB(
-                  12, 8, 12, MediaQuery.of(context).padding.bottom + 8),
+          if (_joined) _buildInputBar(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMsgList(List<QueryDocumentSnapshot> msgs) {
+    if (msgs.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text('🙏', style: TextStyle(fontSize: 40)),
+            const SizedBox(height: 12),
+            Text('Be the first to share',
+                style: GoogleFonts.dmSans(
+                    color: AppTheme.textMuted, fontSize: 14)),
+          ],
+        ),
+      );
+    }
+    return ListView.builder(
+      controller: _scrollCtrl,
+      padding: const EdgeInsets.all(16),
+      itemCount: msgs.length,
+      itemBuilder: (_, i) {
+        final msg = msgs[i].data() as Map<String, dynamic>;
+        final isMe = msg['senderId'] == _auth.currentUser?.uid;
+        return _MsgBubble(data: msg, isMe: isMe);
+      },
+    );
+  }
+
+  Widget _buildInputBar() {
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+          12, 8, 12, MediaQuery.of(context).padding.bottom + 8),
+      decoration: BoxDecoration(
+        color: AppTheme.bgCard,
+        border: Border(top: BorderSide(color: Colors.white.withOpacity(0.06))),
+      ),
+      child: Row(
+        children: [
+          GestureDetector(
+            onTap: _sendingImage ? null : _sendImage,
+            child: Container(
+              width: 40,
+              height: 40,
               decoration: BoxDecoration(
-                color: AppTheme.bgCard,
-                border: Border(
-                    top: BorderSide(color: Colors.white.withOpacity(0.06))),
-              ),
-              child: Row(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.image_outlined,
-                        color: AppTheme.textMuted),
-                    onPressed: _sendImage,
-                  ),
-                  Expanded(
-                    child: TextField(
-                      controller: _msgCtrl,
-                      style: GoogleFonts.dmSans(
-                          color: AppTheme.textPrimary, fontSize: 14),
-                      decoration: InputDecoration(
-                        hintText: 'Share your thoughts...',
-                        hintStyle: GoogleFonts.dmSans(
-                            color: AppTheme.textMuted, fontSize: 14),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(50),
-                          borderSide: BorderSide.none,
-                        ),
-                        filled: true,
-                        fillColor: AppTheme.bgElevated,
-                        contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 18, vertical: 10),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  GestureDetector(
-                    onTap: () => _sendMessage(text: _msgCtrl.text.trim()),
-                    child: Container(
-                      width: 40,
-                      height: 40,
-                      decoration: const BoxDecoration(
-                          color: AppTheme.primary, shape: BoxShape.circle),
-                      child: const Icon(Icons.send_rounded,
-                          color: Colors.white, size: 18),
-                    ),
-                  ),
-                ],
+                  color: AppTheme.bgElevated,
+                  borderRadius: BorderRadius.circular(12)),
+              child: _sendingImage
+                  ? const Padding(
+                      padding: EdgeInsets.all(10),
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: AppTheme.primary))
+                  : const Icon(Icons.image_outlined,
+                      color: AppTheme.textMuted, size: 20),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: TextField(
+              controller: _msgCtrl,
+              style: GoogleFonts.dmSans(
+                  color: AppTheme.textPrimary, fontSize: 14),
+              textCapitalization: TextCapitalization.sentences,
+              decoration: InputDecoration(
+                hintText: 'Share your thoughts...',
+                hintStyle:
+                    GoogleFonts.dmSans(color: AppTheme.textMuted, fontSize: 14),
+                border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(50),
+                    borderSide: BorderSide.none),
+                filled: true,
+                fillColor: AppTheme.bgElevated,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
               ),
             ),
+          ),
+          const SizedBox(width: 8),
+          GestureDetector(
+            onTap: _sending ? null : () => _sendMessage(text: _msgCtrl.text),
+            child: Container(
+              width: 42,
+              height: 42,
+              decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                      colors: [AppTheme.primary, AppTheme.primaryDark]),
+                  shape: BoxShape.circle),
+              child: _sending
+                  ? const Padding(
+                      padding: EdgeInsets.all(11),
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.send_rounded,
+                      color: Colors.white, size: 18),
+            ),
+          ),
         ],
       ),
     );
   }
 }
 
-class _MessageBubble extends StatelessWidget {
+class _MsgBubble extends StatelessWidget {
   final Map<String, dynamic> data;
   final bool isMe;
-
-  const _MessageBubble({required this.data, required this.isMe});
+  const _MsgBubble({required this.data, required this.isMe});
 
   @override
   Widget build(BuildContext context) {
+    final sentAt = data['sentAt'] != null
+        ? (data['sentAt'] as Timestamp).toDate()
+        : DateTime.now();
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Row(
@@ -534,18 +655,19 @@ class _MessageBubble extends StatelessWidget {
                   isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
               children: [
                 if (!isMe)
-                  Text(
-                    data['senderName'] ?? 'Saint',
-                    style: GoogleFonts.dmSans(
-                        color: AppTheme.textMuted,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 2),
+                    child: Text(data['senderName'] ?? 'Saint',
+                        style: GoogleFonts.dmSans(
+                            color: AppTheme.textMuted,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600)),
                   ),
                 Container(
                   constraints: BoxConstraints(
-                    maxWidth: MediaQuery.of(context).size.width * 0.68,
-                  ),
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      maxWidth: MediaQuery.of(context).size.width * 0.68),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                   decoration: BoxDecoration(
                     color: isMe ? AppTheme.primary : AppTheme.bgElevated,
                     borderRadius: BorderRadius.only(
@@ -564,16 +686,21 @@ class _MessageBubble extends StatelessWidget {
                           child: Image.network(data['imageUrl'],
                               width: 200, fit: BoxFit.cover),
                         ),
-                      if (data['text'] != null && data['text']!.isNotEmpty)
-                        Text(
-                          data['text'],
-                          style: GoogleFonts.dmSans(
-                              color: isMe ? Colors.white : AppTheme.textPrimary,
-                              fontSize: 14),
-                        ),
+                      if (data['text'] != null &&
+                          (data['text'] as String).isNotEmpty)
+                        Text(data['text'],
+                            style: GoogleFonts.dmSans(
+                                color:
+                                    isMe ? Colors.white : AppTheme.textPrimary,
+                                fontSize: 14,
+                                height: 1.4)),
                     ],
                   ),
                 ),
+                const SizedBox(height: 3),
+                Text(timeago.format(sentAt, allowFromNow: true),
+                    style: GoogleFonts.dmSans(
+                        color: AppTheme.textMuted, fontSize: 10)),
               ],
             ),
           ),
@@ -583,6 +710,7 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
+// ── Create discussion sheet ────────────────────────────────────────────────────
 class _CreateDiscussionSheet extends StatefulWidget {
   @override
   State<_CreateDiscussionSheet> createState() => _CreateDiscussionSheetState();
@@ -601,6 +729,7 @@ class _CreateDiscussionSheetState extends State<_CreateDiscussionSheet> {
     try {
       final uid = FirebaseAuth.instance.currentUser!.uid;
       final user = await _authService.getUserById(uid);
+      final now = Timestamp.now();
       await _firestore.collection(AppConstants.colDiscussions).add({
         'creatorId': uid,
         'creatorName': user?.name ?? 'Saint',
@@ -611,14 +740,21 @@ class _CreateDiscussionSheetState extends State<_CreateDiscussionSheet> {
             : _descCtrl.text.trim(),
         'membersCount': 1,
         'messagesCount': 0,
-        'createdAt': Timestamp.now(),
-        'lastMessageAt': Timestamp.now(),
+        'createdAt': now,
+        'lastMessageAt': now,
         'isActive': true,
       });
-      Navigator.pop(context);
+      if (mounted) Navigator.pop(context);
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  @override
+  void dispose() {
+    _titleCtrl.dispose();
+    _descCtrl.dispose();
+    super.dispose();
   }
 
   @override
@@ -636,10 +772,9 @@ class _CreateDiscussionSheetState extends State<_CreateDiscussionSheet> {
                   fontWeight: FontWeight.bold,
                   color: AppTheme.textPrimary)),
           const SizedBox(height: 6),
-          Text(
-            'Discussion closes automatically after 24h of inactivity',
-            style: GoogleFonts.dmSans(color: AppTheme.textMuted, fontSize: 12),
-          ),
+          Text('Closes automatically after 24h of inactivity',
+              style:
+                  GoogleFonts.dmSans(color: AppTheme.textMuted, fontSize: 12)),
           const SizedBox(height: 20),
           EcclesiaTextField(
             hint: 'e.g. Understanding Grace and Faith',

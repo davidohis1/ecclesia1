@@ -6,10 +6,12 @@ import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/common_widgets.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../models/post_model.dart';
+import '../../../models/user_model.dart';
 import '../widgets/post_card.dart';
 import '../../messages/screens/messages_screen.dart';
 import '../../search/screens/search_screen.dart';
 import '../../profile/screens/profile_screen.dart';
+import '../../../core/utils/navigation.dart';
 
 class FeedScreen extends StatefulWidget {
   const FeedScreen({super.key});
@@ -24,6 +26,7 @@ class _FeedScreenState extends State<FeedScreen> {
   final _scrollCtrl = ScrollController();
 
   List<PostModel> _posts = [];
+  List<UserModel> _followingUsers = [];
   bool _loading = true;
   DocumentSnapshot? _lastDoc;
   bool _hasMore = true;
@@ -32,6 +35,7 @@ class _FeedScreenState extends State<FeedScreen> {
   @override
   void initState() {
     super.initState();
+    _loadFollowingUsers();
     _loadPosts();
     _scrollCtrl.addListener(_onScroll);
   }
@@ -51,56 +55,99 @@ class _FeedScreenState extends State<FeedScreen> {
     }
   }
 
+  Future<void> _loadFollowingUsers() async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return;
+
+    try {
+      // Get list of users the current user is following
+      final followsSnap = await _firestore
+          .collection(AppConstants.colFollows)
+          .where('followerId', isEqualTo: uid)
+          .limit(20)
+          .get();
+
+      final followingIds = followsSnap.docs.map((d) => d['followingId'] as String).toList();
+
+      if (followingIds.isNotEmpty) {
+        // Fetch user details for each followed user
+        final usersSnap = await _firestore
+            .collection(AppConstants.colUsers)
+            .where('uid', whereIn: followingIds.take(10).toList())
+            .get();
+
+        final users = usersSnap.docs
+            .map((d) => UserModel.fromMap(d.data()))
+            .toList();
+
+        if (mounted) {
+          setState(() {
+            _followingUsers = users;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('Error loading following users: $e');
+    }
+  }
+
   Future<void> _loadPosts() async {
     setState(() => _loading = true);
     try {
-      final uid = _auth.currentUser?.uid;
-      List<PostModel> posts = [];
+      final now = DateTime.now();
+      final yesterday = now.subtract(const Duration(hours: 24));
 
-      if (uid != null) {
-        // Get followed saints posts first
-        final followsSnap = await _firestore
-            .collection(AppConstants.colFollows)
-            .where('followerId', isEqualTo: uid)
-            .get();
-        final followedIds = followsSnap.docs.map((d) => d['followingId'] as String).toList();
+      // Get posts from last 24 hours
+      final recentSnap = await _firestore
+          .collection(AppConstants.colPosts)
+          .where('createdAt', isGreaterThanOrEqualTo: yesterday)
+          .orderBy('createdAt', descending: true)
+          .get();
 
-        if (followedIds.isNotEmpty) {
-          final ids = followedIds.take(10).toList();
-          final snap = await _firestore
-              .collection(AppConstants.colPosts)
-              .where('authorId', whereIn: ids)
-              .orderBy('createdAt', descending: true)
-              .limit(10)
-              .get();
-          posts = snap.docs
-              .map((d) => PostModel.fromMap(d.id, d.data()))
-              .toList();
-          if (snap.docs.isNotEmpty) _lastDoc = snap.docs.last;
-        }
-      }
+      List<PostModel> recentPosts = recentSnap.docs
+          .map((d) => PostModel.fromMap(d.id, d.data()))
+          .toList();
 
-      // Fill with random posts if not enough
-      if (posts.length < 10) {
-        final snap = await _firestore
+      // Shuffle recent posts for randomness
+      recentPosts.shuffle();
+
+      // If we have less than 10 recent posts, get older posts to fill
+      if (recentPosts.length < 10) {
+        final olderSnap = await _firestore
             .collection(AppConstants.colPosts)
+            .where('createdAt', isLessThan: yesterday)
             .orderBy('createdAt', descending: true)
             .limit(20)
             .get();
-        final randomPosts = snap.docs
+
+        final olderPosts = olderSnap.docs
             .map((d) => PostModel.fromMap(d.id, d.data()))
-            .where((p) => !posts.any((ep) => ep.id == p.id))
+            .where((p) => !recentPosts.any((rp) => rp.id == p.id))
             .toList();
-        posts.addAll(randomPosts);
-        if (snap.docs.isNotEmpty) _lastDoc = snap.docs.last;
+
+        // Shuffle older posts
+        olderPosts.shuffle();
+
+        // Combine: all recent posts first, then older posts
+        recentPosts.addAll(olderPosts);
       }
 
       setState(() {
-        _posts = posts;
+        _posts = recentPosts;
         _loading = false;
-        _hasMore = posts.length >= 10;
+        _hasMore = recentPosts.length >= 10;
       });
+
+      // Set last document for pagination
+      if (_posts.isNotEmpty) {
+        final lastPostSnap = await _firestore
+            .collection(AppConstants.colPosts)
+            .doc(_posts.last.id)
+            .get();
+        _lastDoc = lastPostSnap;
+      }
     } catch (e) {
+      debugPrint('Error loading posts: $e');
       setState(() => _loading = false);
     }
   }
@@ -126,6 +173,7 @@ class _FeedScreenState extends State<FeedScreen> {
         _loadingMore = false;
       });
     } catch (e) {
+      debugPrint('Error loading more posts: $e');
       setState(() => _loadingMore = false);
     }
   }
@@ -186,10 +234,23 @@ class _FeedScreenState extends State<FeedScreen> {
               ),
             ],
           ),
-          // Stories Row
+          
+          // Following Users Row
           SliverToBoxAdapter(
-            child: _StoriesRow(),
+            child: _followingUsers.isEmpty
+                ? Container(
+                    height: 88,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    child: const Center(
+                      child: Text(
+                        'Follow some saints to see them here',
+                        style: TextStyle(color: AppTheme.textMuted),
+                      ),
+                    ),
+                  )
+                : _FollowingUsersRow(users: _followingUsers),
           ),
+          
           // Posts
           _loading
               ? SliverToBoxAdapter(
@@ -297,7 +358,11 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 }
 
-class _StoriesRow extends StatelessWidget {
+class _FollowingUsersRow extends StatelessWidget {
+  final List<UserModel> users;
+
+  const _FollowingUsersRow({required this.users});
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -306,10 +371,12 @@ class _StoriesRow extends StatelessWidget {
       child: ListView.builder(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 16),
-        itemCount: 8,
+        itemCount: users.length,
         itemBuilder: (_, i) {
-          if (i == 0) {
-            return Padding(
+          final user = users[i];
+          return GestureDetector(
+            onTap: () => openProfile(context, user.uid),
+            child: Padding(
               padding: const EdgeInsets.only(right: 12),
               child: Column(
                 children: [
@@ -317,56 +384,40 @@ class _StoriesRow extends StatelessWidget {
                     width: 52,
                     height: 52,
                     decoration: BoxDecoration(
-                      color: AppTheme.bgElevated,
                       shape: BoxShape.circle,
-                      border: Border.all(
-                          color: Colors.white.withOpacity(0.1), width: 1.5),
+                      gradient: user.isVerified
+                          ? const LinearGradient(
+                              colors: [AppTheme.primary, AppTheme.accent],
+                            )
+                          : null,
                     ),
-                    child: const Icon(Icons.add, color: AppTheme.primary, size: 22),
+                    padding: user.isVerified ? const EdgeInsets.all(2) : null,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: !user.isVerified
+                            ? Border.all(
+                                color: Colors.white.withOpacity(0.1),
+                                width: 1.5)
+                            : null,
+                      ),
+                      child: UserAvatar(
+                        name: user.name,
+                        imageUrl: user.profilePicUrl,
+                        size: user.isVerified ? 48 : 52,
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 4),
-                  Text('Add',
-                      style: GoogleFonts.dmSans(
-                          color: AppTheme.textMuted, fontSize: 10)),
+                  Text(
+                    user.username.length > 8
+                        ? '${user.username.substring(0, 8)}...'
+                        : user.username,
+                    style: GoogleFonts.dmSans(
+                        color: AppTheme.textMuted, fontSize: 10),
+                  ),
                 ],
               ),
-            );
-          }
-          return Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: Column(
-              children: [
-                Container(
-                  width: 52,
-                  height: 52,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      colors: [
-                        [AppTheme.primary, AppTheme.accent],
-                        [AppTheme.rose, AppTheme.accent],
-                        [AppTheme.teal, AppTheme.primary],
-                        [AppTheme.accent, AppTheme.rose],
-                      ][i % 4],
-                    ),
-                  ),
-                  padding: const EdgeInsets.all(2),
-                  child: Container(
-                    decoration: const BoxDecoration(
-                      color: AppTheme.bgDark,
-                      shape: BoxShape.circle,
-                    ),
-                    padding: const EdgeInsets.all(2),
-                    child: const CircleAvatar(
-                      backgroundColor: AppTheme.bgElevated,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text('Saint ${i}',
-                    style: GoogleFonts.dmSans(
-                        color: AppTheme.textMuted, fontSize: 10)),
-              ],
             ),
           );
         },
@@ -393,6 +444,12 @@ class _CommentsSheetState extends State<_CommentsSheet> {
     final uid = _auth.currentUser?.uid;
     if (uid == null) return;
 
+    // Get user info
+    final userDoc = await _firestore.collection(AppConstants.colUsers).doc(uid).get();
+    final userData = userDoc.data() ?? {};
+    final userName = userData['name'] ?? 'Saint';
+    final userUsername = userData['username'] ?? 'saint';
+
     await _firestore
         .collection(AppConstants.colPosts)
         .doc(widget.post.id)
@@ -400,8 +457,9 @@ class _CommentsSheetState extends State<_CommentsSheet> {
         .add({
       'postId': widget.post.id,
       'authorId': uid,
-      'authorName': 'You',
-      'authorUsername': 'you',
+      'authorName': userName,
+      'authorUsername': userUsername,
+      'authorProfilePic': userData['profilePicUrl'],
       'content': _ctrl.text.trim(),
       'likesCount': 0,
       'createdAt': Timestamp.now(),
@@ -468,8 +526,14 @@ class _CommentsSheetState extends State<_CommentsSheet> {
                     final data = comments[i].data() as Map<String, dynamic>;
                     return ListTile(
                       contentPadding: EdgeInsets.zero,
-                      leading: UserAvatar(
-                          name: data['authorName'] ?? 'S', size: 36),
+                      leading: GestureDetector(
+                        onTap: () => openProfile(context, data['authorId'] ?? ''),
+                        child: UserAvatar(
+                          name: data['authorName'] ?? 'S',
+                          imageUrl: data['authorProfilePic'],
+                          size: 36,
+                        ),
+                      ),
                       title: Text(
                         data['authorName'] ?? 'Saint',
                         style: GoogleFonts.dmSans(
