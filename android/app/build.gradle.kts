@@ -44,5 +44,6 @@ flutter {
 
 // CORRECT Kotlin syntax for dependencies
 dependencies {
-    implementation("com.android.tools:desugar_jdk_libs:2.0.3")
+    // This MUST be "coreLibraryDesugaring", not "implementation"
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
 }
