@@ -16,11 +16,12 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        isCoreLibraryDesugaringEnabled = true  // CORRECT Kotlin syntax
+        isCoreLibraryDesugaringEnabled = true
     }
 
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_17.toString()
+    // Modern way to set jvmTarget
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 
     defaultConfig {
@@ -33,6 +34,7 @@ android {
 
     buildTypes {
         release {
+            // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
@@ -42,11 +44,6 @@ flutter {
     source = "../.."
 }
 
-// CORRECT Kotlin syntax for dependencies
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> eb3fcbc (Second change)
