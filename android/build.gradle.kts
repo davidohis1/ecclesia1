@@ -24,12 +24,12 @@ tasks.register<Delete>("clean") {
 }
 
 subprojects {
-    afterEvaluate { project ->
-        if (project.hasProperty('android')) {
-            project.android {
-                if (namespace == null) {
-                    namespace project.group
-                }
+    afterEvaluate {
+        val android = project.extensions.findByName("android")
+        if (android != null) {
+            val baseExtension = android as? com.android.build.gradle.BaseExtension
+            if (baseExtension?.namespace == null) {
+                baseExtension?.namespace = project.group.toString()
             }
         }
     }
