@@ -19,9 +19,9 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
-    // Modern way to set jvmTarget
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    // Classic style to avoid "Unresolved reference" errors
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
     defaultConfig {
@@ -34,7 +34,6 @@ android {
 
     buildTypes {
         release {
-            // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
